@@ -1,0 +1,21 @@
+# @package _global_.data
+task: line_graph
+
+# Data generation parameters
+n_samples_train: 10000
+n_samples_eval: 1000
+min_T: 3
+max_T: 10
+seed_train: 42
+seed_eval: 99
+
+# Tokenization
+max_length: 256
+data_dir: data_files/line_graph
+
+# DataLoader
+train_files:
+  - ${data.data_dir}/train.pt
+eval_files:
+  - ${data.data_dir}/eval.pt
+num_workers: 4

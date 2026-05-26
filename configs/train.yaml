@@ -1,0 +1,31 @@
+defaults:
+  - model: qwen3_0.6b
+  - data: memorization
+  - _self_
+
+seed: 42
+
+training:
+  mode: standard        # "standard" | "distillation"
+  n_epochs: 3
+  batch_size: 16
+  gradient_accumulation_steps: 1
+  learning_rate: 2.0e-5
+  weight_decay: 0.01
+  warmup_steps: 100
+  max_grad_norm: 1.0
+  eval_interval: 200    # steps between eval runs
+  save_interval: 1000   # steps between checkpoint saves
+  output_dir: outputs/${now:%Y-%m-%d_%H-%M-%S}
+  num_workers: 4
+
+distillation:
+  alpha: 0.5            # alpha * CE + (1-alpha) * KL
+  temperature: 1.0      # softmax temperature for KL term
+  teacher_logits_path: null
+
+wandb:
+  project: distill_pareto
+  name: null            # auto-generated if null
+  entity: bingbin
+  tags: []

@@ -1,0 +1,6 @@
+# @package _global_.model
+family: qwen3
+size: "1.7B"
+variant: base
+torch_dtype: bfloat16
+device_map: auto

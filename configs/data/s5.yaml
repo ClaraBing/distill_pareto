@@ -1,0 +1,26 @@
+# @package _global_.data
+task: s5
+
+# Data generation parameters
+n_samples_train: 10000
+n_samples_eval: 1000
+n_actions: 5
+action_probs: null      # uniform over n_actions if null
+min_T: 10
+max_T: 20
+# Different noun seeds give different 100-noun working sets for train vs eval
+noun_seed_train: 42
+noun_seed_eval: 99
+seed_train: 0
+seed_eval: 1
+
+# Tokenization
+max_length: 256
+data_dir: data_files/s5
+
+# DataLoader
+train_files:
+  - ${data.data_dir}/train.pt
+eval_files:
+  - ${data.data_dir}/eval.pt
+num_workers: 4

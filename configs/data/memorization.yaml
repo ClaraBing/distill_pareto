@@ -1,0 +1,19 @@
+# @package _global_.data
+task: memorization
+
+# Data generation parameters
+n_samples_train: 5000
+n_samples_eval: 500
+seed_train: 42
+seed_eval: 99
+
+# Tokenization
+max_length: 64
+data_dir: data_files/memorization
+
+# DataLoader
+train_files:
+  - ${data.data_dir}/train.pt
+eval_files:
+  - ${data.data_dir}/eval.pt
+num_workers: 4
