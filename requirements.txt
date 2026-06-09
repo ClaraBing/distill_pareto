@@ -1,0 +1,11 @@
+# Core dependencies for distill_pareto.
+# transformers >= 4.51 is REQUIRED: Qwen3 architecture support was only added
+# in 4.51.0. Older versions fail to load Qwen/Qwen3-* checkpoints with
+# "Transformers does not recognize this architecture (qwen3)".
+transformers>=4.51
+
+torch>=2.8
+numpy>=2.2
+hydra-core>=1.3
+omegaconf>=2.3
+wandb>=0.19
