@@ -28,10 +28,12 @@ def eval(
     loader: DataLoader,
     device: str | torch.device = "cuda",
     save_generations: bool = False,
+    eval_generations: bool = False,
     save_logits: bool = False,
     tokenizer: Optional[PreTrainedTokenizerBase] = None,
     max_new_tokens: int = 64,
     output_path: Optional[str] = None,
+    answer_only_loss: bool = False,
 ) -> Dict[str, float | torch.Tensor]:
     """Evaluate *model* on *loader* and return a metrics dict.
 
@@ -41,23 +43,42 @@ def eval(
         device: device to run on.
         save_generations: if True, perform greedy decoding and save text outputs.
             Requires *tokenizer* and *output_path*.
+        eval_generations: if True, 'sequence_accuracy' is computed from
+            free-running greedy generation — the model conditions on its own
+            previous outputs (the prompt only is given) rather than on the
+            ground-truth answer prefix (teacher forcing). Requires *tokenizer*.
+            This is the faithful end-to-end accuracy; the teacher-forced number
+            is misleadingly high (see note below).
         save_logits: if True, save per-token logits for distillation.
             Requires *output_path*. Logits are stored in float16 to save space.
-        tokenizer: needed only when save_generations=True.
-        max_new_tokens: max tokens generated when save_generations=True.
+        tokenizer: needed when save_generations or eval_generations is True.
+        max_new_tokens: max tokens generated for save/eval generations.
         output_path: directory path for saved files.
+        answer_only_loss: if True, compute loss over answer tokens only
+            (positions where labels != -100); otherwise all non-pad tokens.
 
     Returns:
-        dict with at minimum 'loss' and 'token_accuracy' keys.
+        dict with at minimum 'loss' and 'sequence_accuracy' keys. When
+        eval_generations=True, 'sequence_accuracy' is generation-based;
+        otherwise it is teacher-forced.
         When save_logits=True, also includes 'logits_path'.
         When save_generations=True, also includes 'generations_path'.
     """
+    if (save_generations or eval_generations) and tokenizer is None:
+        raise ValueError(
+            "save_generations and eval_generations require a tokenizer"
+        )
+
     model.eval()
     model.to(device)
 
     total_loss = 0.0
     total_correct = 0
     total_tokens = 0
+
+    # Generation-based exact-match counters (used when eval_generations=True).
+    total_gen_correct = 0
+    total_gen_samples = 0
 
     all_logits: list[torch.Tensor] = []
     all_generations: list[str] = []
@@ -70,46 +91,86 @@ def eval(
         outputs = model(
             input_ids=input_ids,
             attention_mask=attention_mask,
-            labels=labels,
         )
-        loss = outputs.loss
         logits = outputs.logits  # [B, L, V]
 
+        # Autoregressive shift: position i's logits predict token i+1.
+        shift_logits = logits[:, :-1, :]
+        V = shift_logits.size(-1)
+
+        # Loss: answer-only tokens or all non-pad tokens, per config.
+        if answer_only_loss:
+            loss_targets = labels[:, 1:]  # -100 for prompt/pad, token id for answer
+        else:
+            loss_targets = input_ids[:, 1:].masked_fill(
+                ~attention_mask[:, 1:].bool(), -100
+            )
+        loss = F.cross_entropy(
+            shift_logits.reshape(-1, V),
+            loss_targets.reshape(-1),
+            ignore_index=-100,
+        )
         total_loss += loss.item() * input_ids.size(0)
 
-        # Token accuracy over answer positions only
-        mask = labels != -100
-        preds = logits.argmax(dim=-1)
-        total_correct += (preds[mask] == labels[mask]).sum().item()
-        total_tokens += mask.sum().item()
+        # Sequence accuracy: ALL answer tokens must be correct (exact match).
+        # Teacher-forced token accuracy is misleadingly high at init because the
+        # model sees the correct answer prefix and can predict structural tokens
+        # (e.g. "Slot", "contains", ",") without knowing the task content.
+        shift_labels = labels[:, 1:]
+        mask = shift_labels != -100
+        preds = shift_logits.argmax(dim=-1)
+        has_answer = mask.any(dim=-1)
+        all_correct = ((preds == shift_labels) | ~mask).all(dim=-1)
+        total_correct += (all_correct & has_answer).sum().item()
+        total_tokens += has_answer.sum().item()
 
         if save_logits:
             all_logits.append(logits.cpu().to(torch.float16))
 
-        if save_generations and tokenizer is not None:
-            # Greedy decode the answer portion for each sample in the batch.
-            # Find where the answer starts: the last non-padded input token
-            # plus 1 (i.e. the first label != -100).
+        if save_generations or eval_generations:
+            # Free-running greedy decode of the answer portion for each sample.
+            # The model sees ONLY the prompt (everything up to the first answer
+            # token, i.e. the first label != -100) and generates autoregressively
+            # from its own outputs — no teacher forcing. A mistake on an early
+            # slot therefore propagates into the context for later slots.
             for i in range(input_ids.size(0)):
-                answer_start = (labels[i] != -100).nonzero(as_tuple=True)[0]
-                if len(answer_start) == 0:
+                answer_idx = (labels[i] != -100).nonzero(as_tuple=True)[0]
+                if len(answer_idx) == 0:
                     continue
-                prompt_ids = input_ids[i, : answer_start[0]].unsqueeze(0)
-                prompt_mask = attention_mask[i, : answer_start[0]].unsqueeze(0)
+                start = answer_idx[0]
+                prompt_ids = input_ids[i, :start].unsqueeze(0)
+                prompt_mask = attention_mask[i, :start].unsqueeze(0)
                 gen_ids = model.generate(
                     input_ids=prompt_ids,
                     attention_mask=prompt_mask,
                     max_new_tokens=max_new_tokens,
                     do_sample=False,
                 )
-                # Decode only the newly generated tokens
+                # Decode only the newly generated tokens.
                 new_ids = gen_ids[0, prompt_ids.size(1):]
-                all_generations.append(tokenizer.decode(new_ids, skip_special_tokens=True))
+                gen_text = tokenizer.decode(new_ids, skip_special_tokens=True)
+
+                if save_generations:
+                    all_generations.append(gen_text)
+
+                if eval_generations:
+                    # Exact-match the generated answer against the reference
+                    # answer (the answer tokens from labels). Compare decoded
+                    # text so trailing eos/pad differences don't matter.
+                    ref_text = tokenizer.decode(
+                        labels[i, answer_idx], skip_special_tokens=True
+                    )
+                    total_gen_correct += int(gen_text.strip() == ref_text.strip())
+                    total_gen_samples += 1
 
     n_samples = len(loader.dataset)
+    if eval_generations:
+        sequence_accuracy = total_gen_correct / max(total_gen_samples, 1)
+    else:
+        sequence_accuracy = total_correct / max(total_tokens, 1)
     metrics: Dict = {
         "loss": total_loss / n_samples,
-        "token_accuracy": total_correct / max(total_tokens, 1),
+        "sequence_accuracy": sequence_accuracy,
     }
 
     if output_path is not None:
@@ -143,7 +204,7 @@ def main(cfg: DictConfig) -> None:
 
     # ── wandb ─────────────────────────────────────────────────────────────────
     run_name = cfg.wandb.name or (
-        f"eval_{cfg.model.family}_{cfg.model.size}_{cfg.data.task}"
+        f"eval_{cfg.model.family}_{cfg.model.size}"
     )
     wandb.init(
         project=cfg.wandb.project,
@@ -173,16 +234,20 @@ def main(cfg: DictConfig) -> None:
 
     save_logits = cfg.get("save_logits", False)
     save_generations = cfg.get("save_generations", False)
+    eval_generations = cfg.get("eval_generations", False)
     output_path = cfg.get("eval_output_path", "eval_outputs")
+    answer_only_loss = cfg.training.answer_only_loss
 
     metrics = eval(
         model=model,
         loader=eval_loader,
         device=device,
         save_generations=save_generations,
+        eval_generations=eval_generations,
         save_logits=save_logits,
         tokenizer=tokenizer,
         output_path=output_path,
+        answer_only_loss=answer_only_loss,
     )
 
     print("Evaluation results:")

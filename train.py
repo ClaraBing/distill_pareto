@@ -32,6 +32,28 @@ from models.get_model import get_model, get_tokenizer
 
 # ── helpers ────────────────────────────────────────────────────────────────────
 
+def get_memory_stats() -> dict:
+    """Return current CUDA memory counters in GiB for wandb logging.
+
+    Covers current and step-peak usage for allocated, reserved, and active
+    memory pools, plus the number of cudaMalloc retries (non-zero means the
+    caching allocator had to free blocks to satisfy an allocation — a leading
+    indicator of OOM pressure). Call torch.cuda.reset_peak_memory_stats()
+    after logging so peak values reflect only the most recent step.
+    """
+    stats = torch.cuda.memory_stats()
+    GiB = 1024 ** 3
+    return {
+        "mem/allocated_GiB":      stats.get("allocated_bytes.all.current", 0) / GiB,
+        "mem/peak_allocated_GiB": stats.get("allocated_bytes.all.peak",    0) / GiB,
+        "mem/reserved_GiB":       stats.get("reserved_bytes.all.current",  0) / GiB,
+        "mem/peak_reserved_GiB":  stats.get("reserved_bytes.all.peak",     0) / GiB,
+        "mem/active_GiB":         stats.get("active_bytes.all.current",    0) / GiB,
+        "mem/peak_active_GiB":    stats.get("active_bytes.all.peak",       0) / GiB,
+        "mem/alloc_retries":      stats.get("num_alloc_retries",           0),
+    }
+
+
 def set_seed(seed: int) -> None:
     random.seed(seed)
     np.random.seed(seed)
@@ -41,49 +63,62 @@ def set_seed(seed: int) -> None:
 
 def compute_loss(
     student_logits: torch.Tensor,
-    labels: torch.Tensor,
+    input_ids: torch.Tensor,
+    attention_mask: torch.Tensor,
     teacher_logits: torch.Tensor | None,
     alpha: float,
     temperature: float,
+    labels: torch.Tensor | None = None,
+    answer_only_loss: bool = False,
 ) -> tuple[torch.Tensor, dict]:
-    """Compute training loss.
+    """Compute training loss (autoregressive).
 
     For distillation: alpha * CE_loss + (1-alpha) * KL_loss.
     For standard training: CE_loss (alpha is ignored).
 
-    All losses are computed only over answer tokens (labels != -100).
+    When answer_only_loss=True, both CE and KL terms are restricted to
+    positions where labels != -100 (answer tokens only). Otherwise, all
+    non-pad positions contribute. logits[:, i] predicts token i+1.
     """
-    mask = labels != -100  # [B, L]
     B, L, V = student_logits.shape
 
-    # ── CE loss ───────────────────────────────────────────────────────────────
-    # Flatten and apply mask
-    flat_logits = student_logits.reshape(-1, V)    # [B*L, V]
-    flat_labels = labels.reshape(-1)               # [B*L]
-    ce_loss = F.cross_entropy(flat_logits, flat_labels, ignore_index=-100)
+    # Autoregressive shift: position i's logits predict token i+1.
+    shift_logits = student_logits[:, :-1, :]        # [B, L-1, V]
+    shift_targets = input_ids[:, 1:]                # [B, L-1]
+
+    if answer_only_loss and labels is not None:
+        # labels has -100 for prompt/pad tokens, token id for answer tokens
+        valid = (labels[:, 1:] != -100)
+        ce_targets = labels[:, 1:]                  # -100 already masks non-answer
+    else:
+        valid = attention_mask[:, 1:].bool()        # all non-pad tokens
+        ce_targets = shift_targets.masked_fill(~valid, -100)
+
+    # ── CE loss ─────────────────────────────────────────────────────────────
+    ce_loss = F.cross_entropy(
+        shift_logits.reshape(-1, V),
+        ce_targets.reshape(-1),
+        ignore_index=-100,
+    )
 
     if teacher_logits is None:
         return ce_loss, {"ce_loss": ce_loss.item()}
 
-    # ── KL loss ───────────────────────────────────────────────────────────────
-    # Apply temperature scaling; compute only over masked positions
-    teacher_logits = teacher_logits.to(student_logits.dtype)
+    # ── KL loss ─────────────────────────────────────────────────────────────
+    # Match student/teacher distributions at every valid position. Index down
+    # to valid positions BEFORE softmax to keep the [N, V] tensors small.
+    shift_teacher = teacher_logits[:, :-1, :]       # [B, L-1, V]
+    student_sel = shift_logits[valid]               # [N, V]
+    teacher_sel = shift_teacher[valid].to(student_sel.dtype)
     if temperature != 1.0:
-        student_scaled = student_logits / temperature
-        teacher_scaled = teacher_logits / temperature
-    else:
-        student_scaled = student_logits
-        teacher_scaled = teacher_logits
+        student_sel = student_sel / temperature
+        teacher_sel = teacher_sel / temperature
 
-    student_log_probs = F.log_softmax(student_scaled, dim=-1)   # [B, L, V]
-    teacher_probs = F.softmax(teacher_scaled, dim=-1)           # [B, L, V]
-
-    # Select only answer token positions
-    student_lp_masked = student_log_probs[mask]   # [N_ans, V]
-    teacher_p_masked = teacher_probs[mask]         # [N_ans, V]
+    student_lp = F.log_softmax(student_sel, dim=-1)
+    teacher_p = F.softmax(teacher_sel, dim=-1)
 
     # KL(teacher || student) = sum_x teacher(x) * (log teacher(x) - log student(x))
-    kl_loss = F.kl_div(student_lp_masked, teacher_p_masked, reduction="batchmean")
+    kl_loss = F.kl_div(student_lp, teacher_p, reduction="batchmean")
 
     # Temperature-squared rescaling (standard in KD literature)
     if temperature != 1.0:
@@ -111,7 +146,7 @@ def main(cfg: DictConfig) -> None:
 
     # ── wandb ─────────────────────────────────────────────────────────────────
     run_name = cfg.wandb.name or (
-        f"{cfg.training.mode}_{cfg.model.family}_{cfg.model.size}_{cfg.data.task}"
+        f"{cfg.training.mode}_{cfg.model.family}_{cfg.model.size}"
     )
     wandb.init(
         project=cfg.wandb.project,
@@ -122,18 +157,39 @@ def main(cfg: DictConfig) -> None:
     )
 
     # ── model & tokenizer ─────────────────────────────────────────────────────
+    from_pretrained = bool(cfg.training.from_pretrained)
+    embedding_from_pretrained = bool(cfg.training.embedding_from_pretrained)
     model = get_model(
         family=cfg.model.family,
         size=cfg.model.size,
         variant=cfg.model.variant,
         torch_dtype=cfg.model.torch_dtype,
         device_map=cfg.model.device_map,
+        from_pretrained=from_pretrained,
+        embedding_from_pretrained=embedding_from_pretrained,
     )
     tokenizer = get_tokenizer(cfg.model.family, cfg.model.size, cfg.model.variant)
+    if not from_pretrained:
+        msg = "Initialized {}/{} from config only (random weights".format(
+            cfg.model.family, cfg.model.size
+        )
+        msg += ", pretrained embeddings)." if embedding_from_pretrained else ")."
+        print(msg)
 
-    # If device_map="auto" the model is already placed; otherwise move manually.
-    if cfg.model.device_map != "auto":
+    # With device_map="auto" the pretrained model is already placed; otherwise
+    # (manual device_map, or config-only init which ignores device_map) move it.
+    if cfg.model.device_map != "auto" or not from_pretrained:
         model = model.to(device)
+
+    # ── freeze layers ─────────────────────────────────────────────────────────
+    if cfg.training.freeze_embeddings:
+        model.get_input_embeddings().requires_grad_(False)
+        print("Froze input embeddings.")
+    if cfg.training.freeze_lm_head:
+        out_emb = model.get_output_embeddings()
+        if out_emb is not None:
+            out_emb.requires_grad_(False)
+        print("Froze lm_head.")
 
     # ── data ──────────────────────────────────────────────────────────────────
     train_loader = get_loader(
@@ -142,12 +198,40 @@ def main(cfg: DictConfig) -> None:
         shuffle=True,
         num_workers=cfg.training.num_workers,
     )
-    eval_loader = get_loader(
-        file_paths=list(cfg.data.eval_files),
-        batch_size=cfg.training.batch_size,
-        shuffle=False,
-        num_workers=cfg.training.num_workers,
-    )
+
+    # One loader per eval file so metrics are reported separately per file.
+    eval_files = list(cfg.data.eval_files)
+    if len(eval_files) == 1:
+        eval_loaders = {
+            "eval": get_loader(
+                file_paths=eval_files,
+                batch_size=cfg.training.batch_size,
+                shuffle=False,
+                num_workers=cfg.training.num_workers,
+            )
+        }
+    else:
+        # Eval files are named "{model_family}_{task}_eval.pt"; key each loader
+        # by just the task, stripping the model-family prefix and "_eval" suffix.
+        model_prefix = f"{cfg.model.family}_"
+
+        def _loader_name(f: str) -> str:
+            name = Path(f).stem
+            if name.startswith(model_prefix):
+                name = name[len(model_prefix):]
+            if name.endswith("_eval"):
+                name = name[: -len("_eval")]
+            return name
+
+        eval_loaders = {
+            _loader_name(f): get_loader(
+                file_paths=[f],
+                batch_size=cfg.training.batch_size,
+                shuffle=False,
+                num_workers=cfg.training.num_workers,
+            )
+            for f in eval_files
+        }
 
     # ── teacher logits (distillation only) ───────────────────────────────────
     teacher_logits_all: torch.Tensor | None = None
@@ -166,9 +250,10 @@ def main(cfg: DictConfig) -> None:
 
     # ── optimizer & scheduler ─────────────────────────────────────────────────
     optimizer = AdamW(
-        model.parameters(),
+        [p for p in model.parameters() if p.requires_grad],
         lr=cfg.training.learning_rate,
         weight_decay=cfg.training.weight_decay,
+        betas=(cfg.training.beta1, cfg.training.beta2),
     )
 
     steps_per_epoch = len(train_loader) // cfg.training.gradient_accumulation_steps
@@ -186,9 +271,15 @@ def main(cfg: DictConfig) -> None:
 
     alpha = cfg.distillation.alpha
     temperature = cfg.distillation.temperature
+    answer_only_loss = cfg.training.answer_only_loss
+    eval_generations = cfg.get("eval_generations", False)
+    save_generations = cfg.get("save_generations", False)
 
     # Track the batch offset into the full dataset for aligning teacher logits
     sample_offset = 0
+
+    if device == "cuda":
+        torch.cuda.memory._record_memory_history(max_entries=100_000)
 
     for epoch in range(cfg.training.n_epochs):
         for batch_idx, batch in enumerate(train_loader):
@@ -197,34 +288,51 @@ def main(cfg: DictConfig) -> None:
             labels = batch["labels"].to(device)
             B = input_ids.size(0)
 
-            outputs = model(
-                input_ids=input_ids,
-                attention_mask=attention_mask,
-            )
-            student_logits = outputs.logits  # [B, L, V]
+            try:
+                outputs = model(
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                )
+                student_logits = outputs.logits  # [B, L, V]
 
-            # Slice teacher logits aligned with this batch
-            teacher_batch: torch.Tensor | None = None
-            if teacher_logits_all is not None:
-                teacher_batch = teacher_logits_all[
-                    sample_offset: sample_offset + B
-                ].to(device)
+                # Slice teacher logits aligned with this batch
+                teacher_batch: torch.Tensor | None = None
+                if teacher_logits_all is not None:
+                    teacher_batch = teacher_logits_all[
+                        sample_offset: sample_offset + B
+                    ].to(device)
 
-            loss, log_dict = compute_loss(
-                student_logits=student_logits,
-                labels=labels,
-                teacher_logits=teacher_batch,
-                alpha=alpha,
-                temperature=temperature,
-            )
+                loss, log_dict = compute_loss(
+                    student_logits=student_logits,
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                    teacher_logits=teacher_batch,
+                    alpha=alpha,
+                    temperature=temperature,
+                    labels=labels,
+                    answer_only_loss=answer_only_loss,
+                )
 
-            # Gradient accumulation
-            loss = loss / cfg.training.gradient_accumulation_steps
-            loss.backward()
+                # Gradient accumulation
+                loss = loss / cfg.training.gradient_accumulation_steps
+                loss.backward()
+
+            except torch.cuda.OutOfMemoryError:
+                snapshot_path = str(output_dir / "oom_snapshot.pkl")
+                torch.cuda.memory._dump_snapshot(snapshot_path)
+                torch.cuda.memory._record_memory_history(enabled=None)
+                wandb.save(snapshot_path)
+                raise RuntimeError(
+                    f"CUDA OOM at epoch={epoch} batch={batch_idx} "
+                    f"(shape={tuple(input_ids.shape)}). "
+                    f"Memory snapshot uploaded to wandb and saved to {snapshot_path}. "
+                    f"Download and visualize at https://pytorch.org/memory_viz"
+                ) from None
 
             if (batch_idx + 1) % cfg.training.gradient_accumulation_steps == 0:
                 torch.nn.utils.clip_grad_norm_(
-                    model.parameters(), cfg.training.max_grad_norm
+                    [p for p in model.parameters() if p.requires_grad],
+                    cfg.training.max_grad_norm,
                 )
                 optimizer.step()
                 scheduler.step()
@@ -233,24 +341,37 @@ def main(cfg: DictConfig) -> None:
 
                 log_dict["lr"] = scheduler.get_last_lr()[0]
                 log_dict["epoch"] = epoch + batch_idx / len(train_loader)
+                if cfg.training.log_memory and device == "cuda":
+                    log_dict.update(get_memory_stats())
+                    torch.cuda.reset_peak_memory_stats()
                 wandb.log(log_dict, step=global_step)
 
                 # ── periodic evaluation ───────────────────────────────────────
                 if global_step % cfg.training.eval_interval == 0:
                     model.eval()
-                    metrics = run_eval(
-                        model=model,
-                        loader=eval_loader,
-                        device=device,
-                    )
-                    wandb.log(
-                        {f"eval/{k}": v for k, v in metrics.items() if isinstance(v, float)},
-                        step=global_step,
-                    )
-                    print(
-                        f"[step {global_step}] eval loss={metrics['loss']:.4f} "
-                        f"acc={metrics['token_accuracy']:.4f}"
-                    )
+                    for loader_name, loader in eval_loaders.items():
+                        metrics = run_eval(
+                            model=model,
+                            loader=loader,
+                            device=device,
+                            answer_only_loss=answer_only_loss,
+                            eval_generations=eval_generations,
+                            save_generations=save_generations,
+                            tokenizer=tokenizer,
+                            output_path=(
+                                str(output_dir / "generations" / f"{loader_name}_step{global_step}")
+                                if save_generations else None
+                            ),
+                        )
+                        prefix = "eval" if len(eval_loaders) == 1 else f"eval/{loader_name}"
+                        wandb.log(
+                            {f"{prefix}/{k}": v for k, v in metrics.items() if isinstance(v, float)},
+                            step=global_step,
+                        )
+                        print(
+                            f"[step {global_step}] {loader_name} "
+                            f"loss={metrics['loss']:.4f} acc={metrics['sequence_accuracy']:.4f}"
+                        )
                     model.train()
 
                 # ── periodic checkpoint ───────────────────────────────────────
@@ -267,18 +388,28 @@ def main(cfg: DictConfig) -> None:
 
     # ── final evaluation & save ───────────────────────────────────────────────
     model.eval()
-    final_metrics = run_eval(
-        model=model,
-        loader=eval_loader,
-        device=device,
-    )
-    wandb.log(
-        {f"final/{k}": v for k, v in final_metrics.items() if isinstance(v, float)}
-    )
-    print("Final evaluation:")
-    for k, v in final_metrics.items():
-        if isinstance(v, float):
-            print(f"  {k}: {v:.4f}")
+    for loader_name, loader in eval_loaders.items():
+        final_metrics = run_eval(
+            model=model,
+            loader=loader,
+            device=device,
+            answer_only_loss=answer_only_loss,
+            eval_generations=eval_generations,
+            save_generations=save_generations,
+            tokenizer=tokenizer,
+            output_path=(
+                str(output_dir / "generations" / f"{loader_name}_final")
+                if save_generations else None
+            ),
+        )
+        prefix = "final" if len(eval_loaders) == 1 else f"final/{loader_name}"
+        wandb.log(
+            {f"{prefix}/{k}": v for k, v in final_metrics.items() if isinstance(v, float)}
+        )
+        print(f"Final evaluation ({loader_name}):")
+        for k, v in final_metrics.items():
+            if isinstance(v, float):
+                print(f"  {k}: {v:.4f}")
 
     final_dir = output_dir / "final"
     model.save_pretrained(final_dir)

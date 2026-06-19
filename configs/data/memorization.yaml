@@ -7,6 +7,12 @@ n_samples_eval: 500
 seed_train: 42
 seed_eval: 99
 
+# Task parameters
+n_pairs: 100        # size of the shared (A, B) relation pool
+min_T: 2            # min number of relations per sample (>=2: T-1 context + 1 query)
+max_T: 10           # max number of relations per sample (must be <= n_pairs)
+pool_seed: 0        # shared between train and eval → train/eval see the same pool
+
 # Tokenization
 max_length: 64
 data_dir: data_files/memorization

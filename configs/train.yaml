@@ -1,23 +1,45 @@
 defaults:
   - model: qwen3_0.6b
-  - data: memorization
   - _self_
 
 seed: 42
 
+# Evaluation options (read by both train.py and evaluate.py; also overridable
+# on the CLI, e.g. `+eval_generations=true`).
+eval_generations: false   # if true, sequence_accuracy is computed from free-running
+                          # greedy generation (the model conditions on its own
+                          # outputs) instead of teacher-forced argmax
+save_generations: false   # if true, save decoded greedy generations to disk
+
+# Data: any list of tokenized .pt files (each a dict with input_ids,
+# attention_mask, labels, optionally teacher_logits). To use one of the
+# task configs in configs/data/, append `+data=<task>` to the CLI.
+data:
+  train_files: []
+  eval_files: []
+  num_workers: 4
+
 training:
   mode: standard        # "standard" | "distillation"
+  from_pretrained: 1    # 1: load pretrained weights; 0: use the model config only (random init)
+  embedding_from_pretrained: 0  # when from_pretrained=0, 1: copy pretrained input/output embeddings, rest random
   n_epochs: 3
   batch_size: 16
   gradient_accumulation_steps: 1
   learning_rate: 2.0e-5
   weight_decay: 0.01
+  beta1: 0.9
+  beta2: 0.999
   warmup_steps: 100
   max_grad_norm: 1.0
   eval_interval: 200    # steps between eval runs
   save_interval: 1000   # steps between checkpoint saves
   output_dir: outputs/${now:%Y-%m-%d_%H-%M-%S}
   num_workers: 4
+  freeze_embeddings: false  # freeze input embedding layer
+  freeze_lm_head: false     # freeze output lm_head layer
+  answer_only_loss: false   # if true, loss is over answer tokens only; otherwise all non-pad tokens
+  log_memory: false         # if true, log detailed GPU memory stats to wandb every optimizer step
 
 distillation:
   alpha: 0.5            # alpha * CE + (1-alpha) * KL

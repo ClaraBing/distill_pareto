@@ -1,9 +1,12 @@
 """CLI for generating and tokenizing synthetic datasets.
 
+The base config (configs/train.yaml) no longer pulls in a task by default, so a
+task-specific data config must be added explicitly with `+data=<task>`.
+
 Usage:
-    python -m data.generate task=memorization data=memorization model=qwen3_0.6b
-    python -m data.generate task=s5          data=s5          model=qwen3_0.6b
-    python -m data.generate task=line_graph  data=line_graph  model=qwen3_0.6b
+    python -m data.generate +data=memorization model=qwen3_0.6b
+    python -m data.generate +data=s5          model=qwen3_0.6b
+    python -m data.generate +data=line_graph  model=qwen3_0.6b
 """
 
 import hydra
@@ -21,7 +24,13 @@ def _build_task(cfg: DictConfig, split: str):
     if task_name == "memorization":
         from data.memorization import MemorizationTask
         seed = cfg.data.seed_train if split == "train" else cfg.data.seed_eval
-        return MemorizationTask(seed=seed)
+        return MemorizationTask(
+            n_pairs=cfg.data.n_pairs,
+            min_T=cfg.data.min_T,
+            max_T=cfg.data.max_T,
+            pool_seed=cfg.data.pool_seed,
+            seed=seed,
+        )
 
     elif task_name == "line_graph":
         from data.line_graph import LineGraphTask

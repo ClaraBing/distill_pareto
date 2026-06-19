@@ -28,55 +28,63 @@ def tokenize(
     output_path: str,
     tokenizer_name_or_path: str,
     max_length: int = 512,
+    chunk_size: int = 2000,
 ) -> None:
     """Tokenize a JSONL file of {input, output} samples and save as a .pt file.
 
     Input tokens are masked in labels (-100); output tokens carry their token id.
     The saved file contains: input_ids, attention_mask, labels.
+
+    Output tensors are pre-allocated and filled in chunks rather than built from
+    per-sample Python lists, so peak memory stays close to the size of the final
+    tensors (matters for large datasets — the list-of-lists approach used ~3-4x
+    more and OOMs on memory-capped nodes).
     """
     tokenizer = AutoTokenizer.from_pretrained(tokenizer_name_or_path)
     if tokenizer.pad_token_id is None:
         tokenizer.pad_token_id = tokenizer.eos_token_id
+    eos = tokenizer.eos_token or ""
 
-    samples = []
+    # Read just the text fields. The answer carries a trailing eos so the model
+    # learns to stop; it is tokenized without special tokens.
+    inputs: List[str] = []
+    answers: List[str] = []
     with open(jsonl_path) as f:
         for line in f:
-            samples.append(json.loads(line.strip()))
+            s = json.loads(line)
+            inputs.append(s["input"])
+            answers.append(s["output"] + eos)
 
-    all_input_ids = []
-    all_attention_mask = []
-    all_labels = []
+    n = len(inputs)
+    pad_id = tokenizer.pad_token_id
+    input_ids = torch.full((n, max_length), pad_id, dtype=torch.long)
+    attention_mask = torch.zeros((n, max_length), dtype=torch.long)
+    labels = torch.full((n, max_length), -100, dtype=torch.long)
 
-    for sample in samples:
-        input_enc = tokenizer(sample["input"], add_special_tokens=True)
-        # Append eos after the answer so the model learns to stop.
-        answer_text = sample["output"] + tokenizer.eos_token
-        output_enc = tokenizer(answer_text, add_special_tokens=False)
-
-        input_ids = input_enc["input_ids"] + output_enc["input_ids"]
-        labels = [-100] * len(input_enc["input_ids"]) + output_enc["input_ids"]
-
-        # Truncate to max_length
-        input_ids = input_ids[:max_length]
-        labels = labels[:max_length]
-
-        pad_len = max_length - len(input_ids)
-        attention_mask = [1] * len(input_ids) + [0] * pad_len
-        input_ids = input_ids + [tokenizer.pad_token_id] * pad_len
-        labels = labels + [-100] * pad_len
-
-        all_input_ids.append(input_ids)
-        all_attention_mask.append(attention_mask)
-        all_labels.append(labels)
+    for start in range(0, n, chunk_size):
+        end = min(start + chunk_size, n)
+        in_enc = tokenizer(inputs[start:end], add_special_tokens=True)["input_ids"]
+        out_enc = tokenizer(answers[start:end], add_special_tokens=False)["input_ids"]
+        for j, (ie, oe) in enumerate(zip(in_enc, out_enc)):
+            row = start + j
+            ids = (ie + oe)[:max_length]
+            L = len(ids)
+            input_ids[row, :L] = torch.tensor(ids, dtype=torch.long)
+            attention_mask[row, :L] = 1
+            # labels: -100 over the (input + pad) tokens, token ids over the
+            # answer tokens that survived truncation.
+            ans_start = len(ie)
+            if ans_start < L:
+                labels[row, ans_start:L] = torch.tensor(ids[ans_start:L], dtype=torch.long)
 
     data = {
-        "input_ids": torch.tensor(all_input_ids, dtype=torch.long),
-        "attention_mask": torch.tensor(all_attention_mask, dtype=torch.long),
-        "labels": torch.tensor(all_labels, dtype=torch.long),
+        "input_ids": input_ids,
+        "attention_mask": attention_mask,
+        "labels": labels,
     }
     Path(output_path).parent.mkdir(parents=True, exist_ok=True)
     torch.save(data, output_path)
-    print(f"Saved {len(samples)} tokenized samples to {output_path}")
+    print(f"Saved {n} tokenized samples to {output_path}")
 
 
 class TokenizedDataset(Dataset):
@@ -124,6 +132,46 @@ def get_loader(
         num_workers=num_workers,
         pin_memory=True,
     )
+
+
+def merge_tokenized_files(
+    file_paths: List[str],
+    output_path: Optional[str] = None,
+) -> Dict[str, torch.Tensor]:
+    """Merge tokenized .pt files (each a dict of tensors) into one dict.
+
+    Each input file is loaded with `torch.load` and must be a dict whose values
+    are tensors that share a leading sample dimension (e.g. input_ids,
+    attention_mask, labels, optionally teacher_logits). All files must contain
+    the same set of keys and matching trailing dimensions per key; tensors are
+    concatenated along dim 0.
+
+    If *output_path* is given the merged dict is saved there.
+    """
+    if not file_paths:
+        raise ValueError("file_paths must contain at least one path")
+
+    loaded = [torch.load(p, weights_only=True) for p in file_paths]
+
+    keys = set(loaded[0].keys())
+    for path, d in zip(file_paths[1:], loaded[1:]):
+        if set(d.keys()) != keys:
+            raise ValueError(
+                f"Key mismatch: {file_paths[0]} has {sorted(keys)}, "
+                f"{path} has {sorted(d.keys())}"
+            )
+
+    merged: Dict[str, torch.Tensor] = {
+        k: torch.cat([d[k] for d in loaded], dim=0) for k in keys
+    }
+
+    if output_path is not None:
+        Path(output_path).parent.mkdir(parents=True, exist_ok=True)
+        torch.save(merged, output_path)
+        n = next(iter(merged.values())).shape[0]
+        print(f"Saved {n} merged samples to {output_path}")
+
+    return merged
 
 
 # ── shared vocabulary pools ───────────────────────────────────────────────────

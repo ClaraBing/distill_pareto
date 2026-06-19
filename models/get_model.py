@@ -2,7 +2,7 @@
 
 from typing import Optional
 import torch
-from transformers import AutoModelForCausalLM, AutoTokenizer, PreTrainedModel, PreTrainedTokenizerBase
+from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer, PreTrainedModel, PreTrainedTokenizerBase
 
 # ── model registry ─────────────────────────────────────────────────────────────
 
@@ -55,6 +55,8 @@ def get_model(
     variant: str = "base",
     torch_dtype: str | torch.dtype = "bfloat16",
     device_map: Optional[str] = "auto",
+    from_pretrained: bool = True,
+    embedding_from_pretrained: bool = False,
     **kwargs,
 ) -> PreTrainedModel:
     """Load and return a causal LM from the registry.
@@ -65,6 +67,11 @@ def get_model(
         variant: 'base' or 'instruct'.
         torch_dtype: dtype string or torch.dtype; defaults to bfloat16.
         device_map: passed to from_pretrained; 'auto' spreads across GPUs.
+        from_pretrained: if True, load the pretrained weights; if False, build
+            the model from the pretrained *config* only (random initialization).
+        embedding_from_pretrained: only used when from_pretrained=False. If True,
+            copy the pretrained input embedding and output (unembedding) matrices
+            into the otherwise randomly-initialized model.
         **kwargs: forwarded to AutoModelForCausalLM.from_pretrained.
     """
     model_id = _resolve_model_id(family, size, variant)
@@ -72,13 +79,52 @@ def get_model(
     if isinstance(torch_dtype, str):
         torch_dtype = getattr(torch, torch_dtype)
 
-    model = AutoModelForCausalLM.from_pretrained(
-        model_id,
-        torch_dtype=torch_dtype,
-        device_map=device_map,
-        **kwargs,
-    )
+    if from_pretrained:
+        model = AutoModelForCausalLM.from_pretrained(
+            model_id,
+            torch_dtype=torch_dtype,
+            device_map=device_map,
+            **kwargs,
+        )
+    else:
+        # Architecture from the pretrained config, but randomly initialized
+        # weights. from_config does not accept device_map; the caller places
+        # the model on-device.
+        config = AutoConfig.from_pretrained(model_id, **kwargs)
+        model = AutoModelForCausalLM.from_config(config, torch_dtype=torch_dtype)
+        if embedding_from_pretrained:
+            _copy_pretrained_embeddings(model, model_id, torch_dtype, **kwargs)
     return model
+
+
+def _copy_pretrained_embeddings(
+    model: PreTrainedModel,
+    model_id: str,
+    torch_dtype: torch.dtype,
+    **kwargs,
+) -> None:
+    """Copy input/output embeddings from the pretrained checkpoint into `model`.
+
+    Loads the pretrained model on CPU, copies its input embedding and output
+    (unembedding) weights/bias into the (random-init) `model`, then frees it.
+    When the architecture ties embeddings, copying the input matrix already sets
+    the output projection; the explicit output copy below is a harmless no-op.
+    """
+    src = AutoModelForCausalLM.from_pretrained(
+        model_id, torch_dtype=torch_dtype, device_map=None, **kwargs
+    )
+
+    model.get_input_embeddings().weight.data.copy_(
+        src.get_input_embeddings().weight.data
+    )
+
+    dst_out, src_out = model.get_output_embeddings(), src.get_output_embeddings()
+    if dst_out is not None and src_out is not None:
+        dst_out.weight.data.copy_(src_out.weight.data)
+        if getattr(dst_out, "bias", None) is not None and getattr(src_out, "bias", None) is not None:
+            dst_out.bias.data.copy_(src_out.bias.data)
+
+    del src
 
 
 def get_tokenizer(
